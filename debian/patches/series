@@ -13,3 +13,4 @@
 0063323_log_tag_from_sip_header.patch
 0065167_pjsip_early_replaces.patch
 0068080_disable_asymmetric_rtp.patch
+0069423_builtin_feature_macro.patch
