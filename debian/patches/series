@@ -14,3 +14,4 @@
 0065167_pjsip_early_replaces.patch
 0068080_disable_asymmetric_rtp.patch
 0069423_builtin_feature_macro.patch
+0070492_ignore_from_domain_contact.patch

@@ -1,0 +1,112 @@
+diff --git a/res/res_pjsip.c b/res/res_pjsip.c
+index bbaf778..b6ee625 100644
+--- a/res/res_pjsip.c
++++ b/res/res_pjsip.c
+@@ -2666,6 +2666,81 @@ static int sip_dialog_create_from(pj_pool_t *pool, pj_str_t *from, const char *u
+ 	return 0;
+ }
+ 
++static int sip_dialog_create_contact(pj_pool_t *pool, pj_str_t *contact, const char *user, const pj_str_t *target, pjsip_tpselector *selector)
++{
++	pj_str_t tmp, local_addr;
++	pjsip_uri *uri;
++	pjsip_sip_uri *sip_uri;
++	pjsip_transport_type_e type = PJSIP_TRANSPORT_UNSPECIFIED;
++	int local_port;
++	char default_user[PJSIP_MAX_URL_SIZE];
++
++	if (ast_strlen_zero(user)) {
++		ast_sip_get_default_from_user(default_user, sizeof(default_user));
++		user = default_user;
++	}
++
++	/* Parse the provided target URI so we can determine what transport it will end up using */
++	pj_strdup_with_null(pool, &tmp, target);
++
++	if (!(uri = pjsip_parse_uri(pool, tmp.ptr, tmp.slen, 0)) ||
++	    (!PJSIP_URI_SCHEME_IS_SIP(uri) && !PJSIP_URI_SCHEME_IS_SIPS(uri))) {
++		return -1;
++	}
++
++	sip_uri = pjsip_uri_get_uri(uri);
++
++	/* Determine the transport type to use */
++	if (PJSIP_URI_SCHEME_IS_SIPS(sip_uri)) {
++		type = PJSIP_TRANSPORT_TLS;
++	} else if (!sip_uri->transport_param.slen) {
++		type = PJSIP_TRANSPORT_UDP;
++	} else {
++		type = pjsip_transport_get_type_from_name(&sip_uri->transport_param);
++	}
++
++	// Inc. 48708 (force UDP transport in Contact header)
++	type = PJSIP_TRANSPORT_UDP;
++
++	if (type == PJSIP_TRANSPORT_UNSPECIFIED) {
++		return -1;
++	}
++
++	/* If the host is IPv6 turn the transport into an IPv6 version */
++	if (pj_strchr(&sip_uri->host, ':') && type < PJSIP_TRANSPORT_START_OTHER) {
++		type = (pjsip_transport_type_e)(((int)type) + PJSIP_TRANSPORT_IPV6);
++	}
++
++	/* Get the local bound address for the transport that will be used when communicating with the provided URI */
++	if (pjsip_tpmgr_find_local_addr(pjsip_endpt_get_tpmgr(ast_sip_get_pjsip_endpoint()), pool, type, selector,
++							      &local_addr, &local_port) != PJ_SUCCESS) {
++
++		/* If no local address can be retrieved using the transport manager use the host one */
++		pj_strdup(pool, &local_addr, pj_gethostname());
++		local_port = pjsip_transport_get_default_port_for_type(PJSIP_TRANSPORT_UDP);
++	}
++
++	/* If IPv6 was specified in the transport, set the proper type */
++	if (pj_strchr(&local_addr, ':') && type < PJSIP_TRANSPORT_START_OTHER) {
++		type = (pjsip_transport_type_e)(((int)type) + PJSIP_TRANSPORT_IPV6);
++	}
++
++	contact->ptr = pj_pool_alloc(pool, PJSIP_MAX_URL_SIZE);
++	contact->slen = pj_ansi_snprintf(contact->ptr, PJSIP_MAX_URL_SIZE,
++				      "<sip:%s@%s%.*s%s:%d%s%s>",
++				      user,
++				      (type & PJSIP_TRANSPORT_IPV6) ? "[" : "",
++				      (int)local_addr.slen,
++				      local_addr.ptr,
++				      (type & PJSIP_TRANSPORT_IPV6) ? "]" : "",
++				      local_port,
++				      (type != PJSIP_TRANSPORT_UDP && type != PJSIP_TRANSPORT_UDP6) ? ";transport=" : "",
++				      (type != PJSIP_TRANSPORT_UDP && type != PJSIP_TRANSPORT_UDP6) ? pjsip_transport_get_type_name(type) : "");
++
++	return 0;
++}
++
++
+ int ast_sip_set_tpselector_from_transport(const struct ast_sip_transport *transport, pjsip_tpselector *selector)
+ {
+ 	RAII_VAR(struct ast_sip_transport_state *, transport_state, NULL, ao2_cleanup);
+@@ -2767,7 +2842,7 @@ void ast_sip_add_usereqphone(const struct ast_sip_endpoint *endpoint, pj_pool_t
+ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint, const char *uri, const char *request_user)
+ {
+ 	char enclosed_uri[PJSIP_MAX_URL_SIZE];
+-	pj_str_t local_uri = { "sip:temp@temp", 13 }, remote_uri, target_uri;
++	pj_str_t local_uri = { "sip:temp@temp", 13 }, remote_uri, target_uri, contact_uri;
+ 	pj_status_t res;
+ 	pjsip_dialog *dlg = NULL;
+ 	const char *outbound_proxy = endpoint->outbound_proxy;
+@@ -2798,10 +2873,15 @@ pjsip_dialog *ast_sip_create_dialog_uac(const struct ast_sip_endpoint *endpoint,
+ 		return NULL;
+ 	}
+ 
++	if (sip_dialog_create_contact(dlg->pool, &contact_uri, endpoint->fromuser, &remote_uri, &selector)) {
++		pjsip_dlg_terminate(dlg);
++		return NULL;
++	}
++
+ 	/* Update the dialog with the new local URI, we do it afterwards so we can use the dialog pool for construction */
+ 	pj_strdup_with_null(dlg->pool, &dlg->local.info_str, &local_uri);
+ 	dlg->local.info->uri = pjsip_parse_uri(dlg->pool, dlg->local.info_str.ptr, dlg->local.info_str.slen, 0);
+-	dlg->local.contact = pjsip_parse_hdr(dlg->pool, &HCONTACT, local_uri.ptr, local_uri.slen, NULL);
++	dlg->local.contact = pjsip_parse_hdr(dlg->pool, &HCONTACT, contact_uri.ptr, contact_uri.slen, NULL);
+ 
+ 	/* If a request user has been specified and we are permitted to change it, do so */
+ 	if (!ast_strlen_zero(request_user)) {
